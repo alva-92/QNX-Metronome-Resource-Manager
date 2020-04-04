@@ -16,7 +16,10 @@
 typedef union
 {
 	struct _pulse   pulse;
-	char msg[255];
+	int             beats_per_minute;
+	int             time_signature_top;
+	int             time_signature_bottom;
+	char            msg[255];
 
 } my_message_t;
 
@@ -205,13 +208,9 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
-	/*
-	 *   TODO: Implement
-	 *   process the command-line arguments:
-	 *   beats-per-minute
-	 *   time-signature (top)
-	 *   time-signature (bottom)
-	 */
+	msg.beats_per_minute      = atoi(argv[1]);
+	msg.time_signature_top    = atoi(argv[2]);
+	msg.time_signature_bottom = atoi(argv[3]);
 
 	dispatch_t* dpp;
 	resmgr_io_funcs_t io_funcs;
@@ -248,7 +247,40 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	// TODO: Create the metronome thread
+	/* Interrupt handler - Applies to child threads */
+	std::signal(SIGUSR1, SIGINT);
+		/* Ignore the following signals */
+	std::signal(SIGUSR2, SIG_IGN);
+	struct sigaction sa;
+	//sa.sa_handler = handler;
+	sa.sa_flags = 0; // or SA_RESTART
+	sigemptyset(&sa.sa_mask);
+
+	if (sigaction(SIGINT, &sa, NULL) == -1)
+	{
+		std::cerr << "Sigaction failed" << std::endl;
+		exit(EXIT_FAILURE);
+	}
+
+	pthread_attr_t attr;
+	pthread_attr_init(&attr); /* Initialize attr with all default thread attributes */
+
+	/*
+	 * @params
+	 *
+	 * threads - Is the location where the ID of the newly created thread should be stored, or NULL if the thread ID is not required.
+	 * attr	   - Is the thread attribute object specifying the attributes for the thread that is being created. If attr is NULL, the thread is created with default attributes.
+	 * task    - Is the main function for the thread; the thread begins executing user code at this address.
+	 * arg     - Is the argument passed to start.
+	 *
+	 */
+	int err = pthread_create(NULL, &attr, &metronome_thread, NULL); /* Create a new thread */
+	if (err != 0)
+	{
+		std::cerr << "Failed to create thread" << std::endl;
+	}
+	pthread_attr_destroy(&attr); /* Destroy the attr */
+
 
 	ctp = dispatch_context_alloc(dpp);
 
