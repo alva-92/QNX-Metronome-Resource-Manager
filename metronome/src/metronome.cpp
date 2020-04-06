@@ -60,7 +60,7 @@ my_message_t msg;
 
 void display_usage()
 {
-	printf("Usage stub");
+	printf("Usage:\n ./metronome <beats-per-minute> <time-signature-top> <time-signature-bottom>\n");
 }
 
 /**
@@ -77,6 +77,7 @@ void* metronome_thread(void* argv)
 		printf("Failed to attach to device");
 	}
 
+	printf("Metronome initializing...\n");
 	/*
 	 *  TODO
 	 *  calculate the seconds-per-beat and nano seconds for the interval timer
@@ -245,7 +246,6 @@ int main(int argc, char *argv[])
 	/* Validate the number of command line arguments as per requirements */
 	if (argc != 4)
 	{
-		perror("Error - Incorrect number of parameters");
 		display_usage();
 		exit(EXIT_FAILURE);
 	}
@@ -270,6 +270,7 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
+
 	iofunc_func_init(_RESMGR_CONNECT_NFUNCS, &connect_funcs, _RESMGR_IO_NFUNCS, &io_funcs);
 	connect_funcs.open = io_open;
 	io_funcs.read = io_read;
@@ -288,6 +289,8 @@ int main(int argc, char *argv[])
 
 		return EXIT_FAILURE;
 	}
+
+	printf("Resource manager attached successfully\n");
 
 	/* Interrupt handler - Applies to child threads */
 	std::signal(SIGUSR1, SIG_ERR);
