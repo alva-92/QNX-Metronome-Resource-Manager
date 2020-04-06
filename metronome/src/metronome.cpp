@@ -7,11 +7,14 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <errno.h>
+#include <pthread.h>
+#include <csignal>
+#include <fcntl.h>
 
-#define ATTACH_POINT    "metronome"
+#define ATTACH_POINT         "metronome"
 #define METRONOME_PULSE_CODE _PULSE_CODE_MINAVAIL
-#define PAUSE_PULSE_CODE 7
-#define QUIT_PULSE_CODE  8
+#define PAUSE_PULSE_CODE     (METRONOME_PULSE_CODE + 7)
+#define QUIT_PULSE_CODE      (METRONOME_PULSE_CODE + 8)
 
 typedef union
 {
@@ -23,17 +26,48 @@ typedef union
 
 } my_message_t;
 
+struct DataTableRow
+{
+	int time_signature_top;
+	int time_signature_bottom;
+	int num_intervals;
+	std::string pattern;
+
+} typedef DataTableRow;
+
+
+/**
+ * Time-signature-top | Time-signature bottom | Number of Intervals within each beat | Pattern for Intervals within Each Beat
+ */
+DataTableRow t[] =
+{
+		{2, 4, 4,   "|1&2&"},
+		{3, 4, 6,   "|1&2&3&"},
+		{4, 4, 8,   "|1&2&3&4&"},
+		{5, 4, 10,  "|1&2&3&4-5-"},
+		{3, 8, 6,   "|1-2-3-"},
+		{6, 8, 6,   "|1&a2&a"},
+		{9, 8, 9,   "|1&a2&a3&a"},
+		{12, 8, 12, "|1&a2&a3&a4&a"}
+};
+
+int row;
 name_attach_t *attach;
 int rcvid;
 char data[255];
 int metronome_coid;
 my_message_t msg;
 
+void display_usage()
+{
+	printf("Usage stub");
+}
+
 /**
  * This function "drives" the metronome. It receives pulse from interval timer;
  * each time the timer expires it receives pulses from io_write (quit and pause <int>)
  */
-void metronome_thread()
+void* metronome_thread(void* argv)
 {
 		/* Phase I - create a named channel to receive pulses */
 
@@ -76,7 +110,7 @@ void metronome_thread()
 			   	    * mid-measure: the symbol, as seen in the column "Pattern for Intervals within Each Beat"
 			   	    * end-of-measure: \n
 			   	    */
-
+				   printf("Metronome pulse");
 				   break;
 
 		       case PAUSE_PULSE_CODE:
@@ -85,6 +119,7 @@ void metronome_thread()
 		    	    * TODO:
 		    	    * pause the running timer for pause <int> seconds
 		    	    */
+		    	   printf("Pausing running timer");
 
 			   	   break;
 		       case QUIT_PULSE_CODE:
@@ -97,7 +132,7 @@ void metronome_thread()
 		    	    * call name_close()
 		    	    * exit with SUCCESS
 		    	    */
-
+		    	   printf("Exiting");
 			   	   break;
 			   default:
 				   printf("Not the expected code");
@@ -107,6 +142,7 @@ void metronome_thread()
 	   }
 
 	}
+	return NULL;
 }
 
 int io_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb)
@@ -140,6 +176,10 @@ int io_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb)
 	return(_RESMGR_NPARTS(1));
 }
 
+/**
+ * This function sends a pulse to the main thread of the metronome to have the metronome
+ * thread pause for the specified number of seconds.
+ */
 int io_write(resmgr_context_t *ctp, io_write_t *msg, RESMGR_OCB_T *ocb)
 {
     int nb = 0;
@@ -163,6 +203,7 @@ int io_write(resmgr_context_t *ctp, io_write_t *msg, RESMGR_OCB_T *ocb)
 			pause = atoi(pause_msg);
 			if(pause >= 1 && pause <= 10)
 			{
+				printf("Sending pause message");
 				MsgSendPulse(metronome_coid, SchedGet(0,0,NULL), PAUSE_PULSE_CODE, pause);
 			}
 			else
@@ -205,6 +246,7 @@ int main(int argc, char *argv[])
 	if (argc != 4)
 	{
 		perror("Error - Incorrect number of parameters");
+		display_usage();
 		exit(EXIT_FAILURE);
 	}
 
@@ -248,7 +290,7 @@ int main(int argc, char *argv[])
 	}
 
 	/* Interrupt handler - Applies to child threads */
-	std::signal(SIGUSR1, SIGINT);
+	std::signal(SIGUSR1, SIG_ERR);
 		/* Ignore the following signals */
 	std::signal(SIGUSR2, SIG_IGN);
 	struct sigaction sa;
