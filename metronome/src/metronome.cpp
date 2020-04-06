@@ -1,20 +1,29 @@
 #include <iostream>
-#include <stdlib.h>
+#include <errno.h>
 #include <stdio.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/types.h>
+
+/*
+ * Define THREAD_POOL_PARAM_T such that we can avoid a compiler
+ * warning when we use the dispatch_*() functions below
+ */
+#define THREAD_POOL_PARAM_T    dispatch_context_t
+
 #include <sys/iofunc.h>
 #include <sys/dispatch.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <errno.h>
-#include <pthread.h>
-#include <csignal>
-#include <fcntl.h>
 
-#define ATTACH_POINT         "metronome"
-#define METRONOME_PULSE_CODE _PULSE_CODE_MINAVAIL
-#define PAUSE_PULSE_CODE     (METRONOME_PULSE_CODE + 7)
-#define QUIT_PULSE_CODE      (METRONOME_PULSE_CODE + 8)
+static resmgr_connect_funcs_t   connect_funcs;
+static resmgr_io_funcs_t        io_funcs;
+static iofunc_attr_t            ioattr;
+
+#define ATTACH_POINT            "metronome"
+#define METRONOME_PULSE_CODE    _PULSE_CODE_MINAVAIL
+#define PAUSE_PULSE_CODE        (METRONOME_PULSE_CODE + 7)
+#define QUIT_PULSE_CODE         (METRONOME_PULSE_CODE + 8)
 
 typedef union
 {
@@ -78,12 +87,16 @@ void* metronome_thread(void* argv)
 	}
 
 	printf("Metronome initializing...\n");
+
+
 	/*
 	 *  TODO
 	 *  calculate the seconds-per-beat and nano seconds for the interval timer
 	 *  create an interval timer to "drive" the metronome
 	 *  configure the interval timer to send a pulse to channel at attach when it expires
 	 */
+
+
 
 		/* Phase II - receive pulses from interval timer OR io_write(pause, quit) */
 	while(1)
@@ -238,6 +251,7 @@ int io_open(resmgr_context_t *ctp, io_open_t *msg, RESMGR_HANDLE_T *handle, void
         perror("name_open failed.");
         return EXIT_FAILURE;
     }
+    printf("IO Opened\n");
     return (iofunc_open_default (ctp, msg, handle, extra));
 }
 
@@ -254,12 +268,14 @@ int main(int argc, char *argv[])
 	msg.time_signature_top    = atoi(argv[2]);
 	msg.time_signature_bottom = atoi(argv[3]);
 
-	dispatch_t* dpp;
-	resmgr_io_funcs_t io_funcs;
-	resmgr_connect_funcs_t connect_funcs;
-	iofunc_attr_t ioattr;
+	thread_pool_attr_t pool_attr;
+	thread_pool_t      *tpp;
+	dispatch_t         *dpp;
+	resmgr_attr_t      resmgr_attr;
+	int                id;
+
 	dispatch_context_t   *ctp;
-	int id;
+
 
 	if ((dpp = dispatch_create ()) == NULL)
 	{
@@ -270,17 +286,61 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
+	/* Initialize thread pool attributes */
+	memset(&pool_attr, 0, sizeof(pool_attr));
+	pool_attr.handle        = dpp;                     /* Handle that gets passed to the context_alloc function */
+	pool_attr.context_alloc = dispatch_context_alloc;  /* The function that's called when the worker thread is ready to block, waiting for work. This function returns a pointer that's passed to handler_func. */
+	pool_attr.block_func    = dispatch_block;          /* The function that's called to unblock threads */
+	pool_attr.unblock_func  = dispatch_unblock;        /* The function that's called after block_func returns to do some work. The function is passed the pointer returned by block_func. */
+	pool_attr.handler_func  = dispatch_handler;        /* The function that's called when a new thread is created by the thread pool. It is passed handle. */
+	pool_attr.context_free  = dispatch_context_free;   /* The function that's called when the worker thread exits, to free the context allocated with context_alloc. */
+	pool_attr.lo_water      = 2;                       /* The minimum number of threads that the pool should keep in the blocked state (i.e. threads that are ready to do work). */
+	pool_attr.hi_water      = 4;                       /* The maximum number of threads to keep in a blocked state. */
+	pool_attr.increment     = 1;                       /* The number of new threads created at one time. */
+	pool_attr.maximum       = 50;                      /* The maximum number of threads that the pool can create. */
 
-	iofunc_func_init(_RESMGR_CONNECT_NFUNCS, &connect_funcs, _RESMGR_IO_NFUNCS, &io_funcs);
+	/* allocate a thread pool handle */
+	if ((tpp = thread_pool_create(&pool_attr,
+	POOL_FLAG_EXIT_SELF)) == NULL)
+	{
+		fprintf(stderr,
+				"%s: Unable to initialize thread pool.\n",
+				argv[0]);
+
+		return EXIT_FAILURE;
+	}
+
+	iofunc_func_init(_RESMGR_CONNECT_NFUNCS,
+			          &connect_funcs,
+					  _RESMGR_IO_NFUNCS,
+					  &io_funcs);
+
+	/* Overload the functions */
 	connect_funcs.open = io_open;
-	io_funcs.read = io_read;
-	io_funcs.write = io_write;
+	io_funcs.read      = io_read;
+	io_funcs.write     = io_write;
 
-	iofunc_attr_init(&ioattr, S_IFCHR | 0666, NULL, NULL);
+	iofunc_attr_init(&ioattr,
+			         S_IFNAM | 0666,
+					 0,
+					 0);
 
-	if ((id = resmgr_attach (dpp, NULL, "/dev/local/metronome",
-					_FTYPE_ANY, 0, &connect_funcs, &io_funcs,
-	                &ioattr)) == -1)
+    memset( &resmgr_attr, 0, sizeof resmgr_attr );
+    resmgr_attr.nparts_max   = 1;
+    resmgr_attr.msg_max_size = 2048;
+
+
+	/* Attach to device to open for clients to communicate */
+	id = resmgr_attach (dpp,                     /* dispatch handle */
+						&resmgr_attr,            /* resource manager attrs */
+						"/dev/local/metronome",  /* device name */
+						_FTYPE_ANY,              /* open type */
+						0,                       /* flags */
+						&connect_funcs,          /* connect routines */
+						&io_funcs,               /* I/O routines */
+						&ioattr);                /* handle */
+
+	if (id == -1)
 	{
 
 		fprintf (stderr,
@@ -292,40 +352,11 @@ int main(int argc, char *argv[])
 
 	printf("Resource manager attached successfully\n");
 
-	/* Interrupt handler - Applies to child threads */
-	std::signal(SIGUSR1, SIG_ERR);
-		/* Ignore the following signals */
-	std::signal(SIGUSR2, SIG_IGN);
-	struct sigaction sa;
-	//sa.sa_handler = handler;
-	sa.sa_flags = 0; // or SA_RESTART
-	sigemptyset(&sa.sa_mask);
+    /* Start the thread which will handle interrupt events. */
+    pthread_create ( NULL, NULL, metronome_thread, NULL );
 
-	if (sigaction(SIGINT, &sa, NULL) == -1)
-	{
-		std::cerr << "Sigaction failed" << std::endl;
-		exit(EXIT_FAILURE);
-	}
-
-	pthread_attr_t attr;
-	pthread_attr_init(&attr); /* Initialize attr with all default thread attributes */
-
-	/*
-	 * @params
-	 *
-	 * threads - Is the location where the ID of the newly created thread should be stored, or NULL if the thread ID is not required.
-	 * attr	   - Is the thread attribute object specifying the attributes for the thread that is being created. If attr is NULL, the thread is created with default attributes.
-	 * task    - Is the main function for the thread; the thread begins executing user code at this address.
-	 * arg     - Is the argument passed to start.
-	 *
-	 */
-	int err = pthread_create(NULL, &attr, &metronome_thread, NULL); /* Create a new thread */
-	if (err != 0)
-	{
-		std::cerr << "Failed to create thread" << std::endl;
-	}
-	pthread_attr_destroy(&attr); /* Destroy the attr */
-
+    /* Never returns */
+    thread_pool_start( tpp );
 
 	ctp = dispatch_context_alloc(dpp);
 
