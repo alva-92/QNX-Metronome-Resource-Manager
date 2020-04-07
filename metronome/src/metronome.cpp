@@ -28,10 +28,11 @@ static iofunc_attr_t            ioattr;
 typedef union
 {
 	struct _pulse   pulse;
-	int             beats_per_minute;
-	int             time_signature_top;
-	int             time_signature_bottom;
-	char            msg[255];
+	struct METRONOME{
+		int             beats_per_minute;
+		int             time_signature_top;
+		int             time_signature_bottom;
+	} METRONOME;
 
 } my_message_t;
 
@@ -86,15 +87,28 @@ void* metronome_thread(void* argv)
 		printf("Failed to attach to device");
 	}
 
+
 	printf("Metronome initializing...\n");
 
+	 // TODO: calculate the seconds-per-beat and nano seconds for the interval timer
+	double pattern_interval = (60/msg.METRONOME.beats_per_minute)*msg.METRONOME.time_signature_top; /* Calculate the time for starting a new line */
+	double output_internal = 0.0;
 
-	/*
-	 *  TODO
-	 *  calculate the seconds-per-beat and nano seconds for the interval timer
-	 *  create an interval timer to "drive" the metronome
-	 *  configure the interval timer to send a pulse to channel at attach when it expires
-	 */
+	printf("Matching key top %d - bottom %d\n", msg.METRONOME.time_signature_top, msg.METRONOME.time_signature_bottom);
+	for (int i = 0; i < 8; i++)
+	{
+		if (t[i].time_signature_top == msg.METRONOME.time_signature_top && t[i].time_signature_bottom == msg.METRONOME.time_signature_bottom){
+			output_internal = t[i].num_intervals;
+			printf("MATCH - Time signature top %d Time signature bottom %d Output interval %d\n", t[i].time_signature_top, t[i].time_signature_bottom, t[i].num_intervals);
+		} else {
+			printf("No match - Time signature top %d Time signature bottom %d Output interval %d\n", t[i].time_signature_top, t[i].time_signature_bottom, t[i].num_intervals);
+		}
+	}
+
+	printf("Ready to receive messages...\n");
+	//double spacing_timer    = pattern_interval/
+	 // TOOD: create an interval timer to "drive" the metronome
+	 // TODO: configure the interval timer to send a pulse to channel at attach when it expires
 
 
 
@@ -264,10 +278,13 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
-	msg.beats_per_minute      = atoi(argv[1]);
-	msg.time_signature_top    = atoi(argv[2]);
-	msg.time_signature_bottom = atoi(argv[3]);
+    memset( &msg, 0, sizeof(my_message_t));
 
+    msg.METRONOME.beats_per_minute      = atoi(argv[1]);
+    msg.METRONOME.time_signature_top    = atoi(argv[2]);
+    msg.METRONOME.time_signature_bottom = atoi(argv[3]);
+
+	printf("Handling sequence %d %d %d\n", msg.METRONOME.beats_per_minute, msg.METRONOME.time_signature_top, msg.METRONOME.time_signature_bottom);
 	thread_pool_attr_t pool_attr;
 	thread_pool_t      *tpp;
 	dispatch_t         *dpp;
