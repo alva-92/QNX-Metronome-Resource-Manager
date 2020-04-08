@@ -6,6 +6,10 @@
 #include <unistd.h>
 #include <string.h>
 #include <sys/types.h>
+#include <time.h>
+#include <signal.h>
+#include <sys/siginfo.h>
+#include <sys/neutrino.h>
 
 /*
  * Define THREAD_POOL_PARAM_T such that we can avoid a compiler
@@ -16,19 +20,22 @@
 #include <sys/iofunc.h>
 #include <sys/dispatch.h>
 
-static resmgr_connect_funcs_t   connect_funcs;
-static resmgr_io_funcs_t        io_funcs;
-static iofunc_attr_t            ioattr;
+static resmgr_connect_funcs_t   connect_funcs;    /* POSIX calls that use device name  e.g. open, unlink */
+static resmgr_io_funcs_t        io_funcs;         /* POSIX calls that use file descriptors e.g. read, write */
+static iofunc_attr_t            ioattr;           /* Describes the attributes of the device that's associated with a resource manager. Handles device identifiers */
 
+#define PATHNAME                "/dev/local/metronome"
 #define ATTACH_POINT            "metronome"
 #define METRONOME_PULSE_CODE    _PULSE_CODE_MINAVAIL
 #define PAUSE_PULSE_CODE        (METRONOME_PULSE_CODE + 7)
 #define QUIT_PULSE_CODE         (METRONOME_PULSE_CODE + 8)
+#define EXPECTED_NUM_ATTR       4
 
 typedef union
 {
 	struct _pulse   pulse;
-	struct METRONOME{
+	struct METRONOME
+	{
 		int             beats_per_minute;
 		int             time_signature_top;
 		int             time_signature_bottom;
@@ -63,14 +70,34 @@ DataTableRow t[] =
 
 int row;
 name_attach_t *attach;
-int rcvid;
+int     chid;               // channel ID (global)
+int rcvid; /* Process ID of the sender  */
 char data[255];
 int metronome_coid;
-my_message_t msg;
+my_message_t msg; /* Actual message structure */
+double output_internal;
+double pattern_interval;
+char    *progname = "time1.c";
 
 void display_usage()
 {
 	printf("Usage:\n ./metronome <beats-per-minute> <time-signature-top> <time-signature-bottom>\n");
+}
+
+int timer_tick(message_context_t *ctp, int code, unsigned flags, void *handle) {
+
+    union sigval value = ctp->msg->pulse.value;
+    /*
+     *  Do some useful work on every timer firing
+     *  ....
+     */
+    printf("received timer event, value %d\n", value.sival_int);
+    return 0;
+}
+
+int message_handler(message_context_t *ctp, int code, unsigned flags, void *handle) {
+    printf("received private message, type %d\n", code);
+    return 0;
 }
 
 /**
@@ -87,12 +114,11 @@ void* metronome_thread(void* argv)
 		printf("Failed to attach to device");
 	}
 
-
 	printf("Metronome initializing...\n");
 
 	 // TODO: calculate the seconds-per-beat and nano seconds for the interval timer
-	double pattern_interval = (60/msg.METRONOME.beats_per_minute)*msg.METRONOME.time_signature_top; /* Calculate the time for starting a new line */
-	double output_internal = 0.0;
+	pattern_interval = (60/msg.METRONOME.beats_per_minute)*msg.METRONOME.time_signature_top; /* Calculate the time for starting a new line */
+	output_internal = 0.0;
 
 	printf("Matching key top %d - bottom %d\n", msg.METRONOME.time_signature_top, msg.METRONOME.time_signature_bottom);
 	for (int i = 0; i < 8; i++)
@@ -100,7 +126,9 @@ void* metronome_thread(void* argv)
 		if (t[i].time_signature_top == msg.METRONOME.time_signature_top && t[i].time_signature_bottom == msg.METRONOME.time_signature_bottom){
 			output_internal = t[i].num_intervals;
 			printf("MATCH - Time signature top %d Time signature bottom %d Output interval %d\n", t[i].time_signature_top, t[i].time_signature_bottom, t[i].num_intervals);
-		} else {
+		}
+		else
+		{
 			printf("No match - Time signature top %d Time signature bottom %d Output interval %d\n", t[i].time_signature_top, t[i].time_signature_bottom, t[i].num_intervals);
 		}
 	}
@@ -110,6 +138,7 @@ void* metronome_thread(void* argv)
 	 // TOOD: create an interval timer to "drive" the metronome
 	 // TODO: configure the interval timer to send a pulse to channel at attach when it expires
 
+    // set up the pulse and timer
 
 
 		/* Phase II - receive pulses from interval timer OR io_write(pause, quit) */
@@ -138,7 +167,7 @@ void* metronome_thread(void* argv)
 			   	    * mid-measure: the symbol, as seen in the column "Pattern for Intervals within Each Beat"
 			   	    * end-of-measure: \n
 			   	    */
-				   printf("Metronome pulse");
+				   printf("Metronome pulse\n");
 				   break;
 
 		       case PAUSE_PULSE_CODE:
@@ -147,7 +176,7 @@ void* metronome_thread(void* argv)
 		    	    * TODO:
 		    	    * pause the running timer for pause <int> seconds
 		    	    */
-		    	   printf("Pausing running timer");
+		    	   printf("Pausing running timer\n");
 
 			   	   break;
 		       case QUIT_PULSE_CODE:
@@ -160,10 +189,10 @@ void* metronome_thread(void* argv)
 		    	    * call name_close()
 		    	    * exit with SUCCESS
 		    	    */
-		    	   printf("Exiting");
+		    	   printf("Exiting\n");
 			   	   break;
 			   default:
-				   printf("Not the expected code");
+				   printf("Not the expected code\n");
 				   break;
 			   }
 		   continue;
@@ -173,11 +202,18 @@ void* metronome_thread(void* argv)
 	return NULL;
 }
 
+/**
+ * Overloaded function responsible for returning bytes to the client after receiving an _IO_READ message
+ *
+ * @param ctp - Pointer to the structure containing details about who and what to return to the client
+ * @param msg - Pointer to the message sent by the client
+ * @param ocb - Pointer to a structure containing the information about the client/server interaction
+ */
 int io_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb)
 {
-	int nb;
+	int nb; /* Number of bytes to send back */
 
-	if (data == NULL)
+	if(data == NULL)
 	{
 		return 0;
 	}
@@ -186,32 +222,39 @@ int io_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb)
 	sprintf(data, "[metronome: %d beats/min, time signature %d/%d, secs-per-beat: %.2f, nanoSecs: %d]\n");
 	nb = strlen(data);
 
-	if (ocb->offset == nb) /* Test to see if we have already sent the whole message. */
+	if (ocb->offset == nb) /* Test to see if we have already sent the whole message. (EOF) */
 	{
 		return 0;
 	}
 
-	nb = std::min<int>(nb, msg->i.nbytes); /* return which ever is smaller the size of our data or the size of the buffer */
+		/* Determine how many bytes the client is requesting */
+	nb = std::min<int>(nb, msg->i.nbytes); /* Return which ever is smaller the size of our data or the size of the buffer */
 
-	_IO_SET_READ_NBYTES(ctp, nb); /* Set the number of bytes we will return */
-	SETIOV(ctp->iov, data, nb);   /* Copy data into reply buffer. */
+	_IO_SET_READ_NBYTES(ctp, nb); /* Read nbytes of data and set the number of bytes we will return */
+	SETIOV(ctp->iov, data, nb);   /* Fill the return buffer with the data and size (Copy data into reply buffer) */
 	ocb->offset += nb; /* update offset into our data used to determine start position for next read. */
 
 	if (nb > 0) /* If we are going to send any bytes update the access time for this resource. */
 	{
 		ocb->attr->flags |= IOFUNC_ATTR_ATIME;
 	}
-	return(_RESMGR_NPARTS(1));
+		/* Return to the resource manager library so it can do a MsgReply */
+	return(_RESMGR_NPARTS(1)); /* The one is the number of parts we are sending */
 }
 
 /**
- * This function sends a pulse to the main thread of the metronome to have the metronome
+ * Overloaded function that sends a pulse to the main thread of the metronome to have the metronome
  * thread pause for the specified number of seconds.
+ *
+ * @param ctp - Pointer to the structure containing details about who and what to return to the client
+ * @param msg - Pointer to the message sent by the client
+ * @param ocb - Pointer to a structure containing the information about the client/server interaction
  */
 int io_write(resmgr_context_t *ctp, io_write_t *msg, RESMGR_OCB_T *ocb)
 {
     int nb = 0;
 
+    /* Check if the number of bytes to be written match the message length - All the data is in the current buffer */
     if( msg->i.nbytes == ctp->info.msglen - (ctp->offset + sizeof(*msg) ))
     {
 		char *buf;
@@ -220,7 +263,7 @@ int io_write(resmgr_context_t *ctp, io_write_t *msg, RESMGR_OCB_T *ocb)
 		int pause;
 		buf = (char *)(msg+1);
 
-		std::cout << "Buffer: \n" << buf << std::endl;
+		std::cout << "Buffer: " << buf << "\n" << std::endl;
 		std::cout.flush();
 
 		if(strstr(buf, "pause") != NULL)
@@ -231,7 +274,7 @@ int io_write(resmgr_context_t *ctp, io_write_t *msg, RESMGR_OCB_T *ocb)
 			pause = atoi(pause_msg);
 			if(pause >= 1 && pause <= 10)
 			{
-				printf("Sending pause message");
+				printf("Sending pause message\n");
 				MsgSendPulse(metronome_coid, SchedGet(0,0,NULL), PAUSE_PULSE_CODE, pause);
 			}
 			else
@@ -250,19 +293,28 @@ int io_write(resmgr_context_t *ctp, io_write_t *msg, RESMGR_OCB_T *ocb)
 
 		nb = msg->i.nbytes;
     }
+    else
+    {
+    	/* There is more data - requires resmgr_msfread to request more data */
+    }
 
-    _IO_SET_WRITE_NBYTES (ctp, nb);
+    _IO_SET_WRITE_NBYTES (ctp, nb); /* Set the number of bytes that were written */
 
     if (msg->i.nbytes > 0)
-        ocb->attr->flags |= IOFUNC_ATTR_MTIME | IOFUNC_ATTR_CTIME;
-
+    {
+    	ocb->attr->flags |= IOFUNC_ATTR_MTIME | IOFUNC_ATTR_CTIME; /* Update the access times of the resource */
+    }
     return (_RESMGR_NPARTS (0));
 }
 
+/**
+ * Overloaded function to handle the setup and identification of a given client
+ */
 int io_open(resmgr_context_t *ctp, io_open_t *msg, RESMGR_HANDLE_T *handle, void *extra)
 {
-    if ((metronome_coid = name_open( "metronome", 0 )) == -1) {
-        perror("name_open failed.");
+    if ((metronome_coid = name_open("metronome", 0)) == -1)
+    {
+        perror("name_open failed.\n");
         return EXIT_FAILURE;
     }
     printf("IO Opened\n");
@@ -272,38 +324,44 @@ int io_open(resmgr_context_t *ctp, io_open_t *msg, RESMGR_HANDLE_T *handle, void
 int main(int argc, char *argv[])
 {
 	/* Validate the number of command line arguments as per requirements */
-	if (argc != 4)
+	if (argc != EXPECTED_NUM_ATTR)
 	{
 		display_usage();
 		exit(EXIT_FAILURE);
 	}
 
-    memset( &msg, 0, sizeof(my_message_t));
+    if ((chid = ChannelCreate (0)) == -1)
+    {
+        printf("Couldn't create channel\n");
+        exit(EXIT_FAILURE);
+    }
 
+    	/* Process command line input */
+    memset(&msg, 0, sizeof(my_message_t));
     msg.METRONOME.beats_per_minute      = atoi(argv[1]);
     msg.METRONOME.time_signature_top    = atoi(argv[2]);
     msg.METRONOME.time_signature_bottom = atoi(argv[3]);
 
-	printf("Handling sequence %d %d %d\n", msg.METRONOME.beats_per_minute, msg.METRONOME.time_signature_top, msg.METRONOME.time_signature_bottom);
-	thread_pool_attr_t pool_attr;
-	thread_pool_t      *tpp;
-	dispatch_t         *dpp;
-	resmgr_attr_t      resmgr_attr;
-	int                id;
+    printf("DEBUG: Handling sequence %d %d %d\n", msg.METRONOME.beats_per_minute, msg.METRONOME.time_signature_top, msg.METRONOME.time_signature_bottom);
 
+	thread_pool_attr_t   pool_attr;      /* Specifies the attributes that you want to use for the thread pool */
+	thread_pool_t        *tpp;
+	dispatch_t           *dpp;           /* Dispatch structure used to schedule the calling of user functions */
+	resmgr_attr_t        resmgr_attr;
 	dispatch_context_t   *ctp;
+    struct sigevent      event;
+    struct _itimer       itime;
+	int                  id;
+	int                  timer_id;
 
-
-	if ((dpp = dispatch_create ()) == NULL)
+	/* Create dispatch structure */
+	if ((dpp = dispatch_create()) == NULL)
 	{
-		fprintf (stderr,
-				"%s:  Unable to allocate dispatch context.\n",
-				argv [0]);
-
+		printf ("Unable to allocate dispatch context.\n");
 		return EXIT_FAILURE;
 	}
 
-	/* Initialize thread pool attributes */
+		/* Initialize thread pool attributes */
 	memset(&pool_attr, 0, sizeof(pool_attr));
 	pool_attr.handle        = dpp;                     /* Handle that gets passed to the context_alloc function */
 	pool_attr.context_alloc = dispatch_context_alloc;  /* The function that's called when the worker thread is ready to block, waiting for work. This function returns a pointer that's passed to handler_func. */
@@ -316,71 +374,104 @@ int main(int argc, char *argv[])
 	pool_attr.increment     = 1;                       /* The number of new threads created at one time. */
 	pool_attr.maximum       = 50;                      /* The maximum number of threads that the pool can create. */
 
-	/* allocate a thread pool handle */
-	if ((tpp = thread_pool_create(&pool_attr,
-	POOL_FLAG_EXIT_SELF)) == NULL)
+		/* Create the thread pool handle */
+	if ((tpp = thread_pool_create(&pool_attr, POOL_FLAG_EXIT_SELF)) == NULL)
 	{
-		fprintf(stderr,
-				"%s: Unable to initialize thread pool.\n",
-				argv[0]);
-
+		printf("Unable to create thread pool.\n");
 		return EXIT_FAILURE;
 	}
 
+		/* Fill out tables with the default resource manager IO functions  */
 	iofunc_func_init(_RESMGR_CONNECT_NFUNCS,
 			          &connect_funcs,
 					  _RESMGR_IO_NFUNCS,
 					  &io_funcs);
 
-	/* Overload the functions */
+		/* Overload the functions */
 	connect_funcs.open = io_open;
 	io_funcs.read      = io_read;
 	io_funcs.write     = io_write;
 
-	iofunc_attr_init(&ioattr,
-			         S_IFNAM | 0666,
-					 0,
-					 0);
+		/* Fill out device attributes structure to define the device the resource manager is going to manage */
+	iofunc_attr_init(&ioattr,                    /* A pointer to the iofunc_attr_t structure that needs to be initialized */
+			         S_IFCHR | 0666,             /* Set permission for Character special file - See README for other permissions */
+					 NULL,                       /* Pointer to a iofunc_attr_t structure to initialize the structure pointed to by attr. */
+					 NULL);                      /* Pointer to a _client_info structure that contains the information about a client connection */
 
-    memset( &resmgr_attr, 0, sizeof resmgr_attr );
-    resmgr_attr.nparts_max   = 1;
-    resmgr_attr.msg_max_size = 2048;
+		/* Initialize resource manager attributes */
+    memset(&resmgr_attr, 0, sizeof resmgr_attr);
+    resmgr_attr.nparts_max   = 1;                /* Number of IOV structures available for server replies */
+    resmgr_attr.msg_max_size = 2048;             /* Minimum receive buffer size */
 
 
-	/* Attach to device to open for clients to communicate */
+		/* Attach resource manager to device to open for clients to communicate */
 	id = resmgr_attach (dpp,                     /* dispatch handle */
 						&resmgr_attr,            /* resource manager attrs */
-						"/dev/local/metronome",  /* device name */
-						_FTYPE_ANY,              /* open type */
-						0,                       /* flags */
+						PATHNAME,                /* Device's path */
+						_FTYPE_ANY,              /* Message types supported */
+						0,                       /* Control flags */
 						&connect_funcs,          /* connect routines */
 						&io_funcs,               /* I/O routines */
-						&ioattr);                /* handle */
+						&ioattr);                /* Pointer to device attributes */
 
 	if (id == -1)
 	{
-
-		fprintf (stderr,
-				"%s:  Unable to attach name.\n",
-				argv [0]);
-
+		printf("Unable to attach name.\n");
 		return EXIT_FAILURE;
 	}
 
-	printf("Resource manager attached successfully\n");
+	printf("DEBUG - Resource manager attached successfully\n");
+
+    /* We want to handle our own private messages, of type 0x5000 to 0x5fff */
+    if(message_attach(dpp, NULL, 0x5000, 0x5fff, &message_handler, NULL) == -1) {
+        fprintf(stderr, "Unable to attach to private message range.\n");
+         return EXIT_FAILURE;
+    }
+
+    /* Initialize an event structure, and attach a pulse to it */
+    if((event.sigev_code = pulse_attach(dpp, METRONOME_PULSE_CODE, 0, &timer_tick,
+                                        NULL)) == -1) {
+        fprintf(stderr, "Unable to attach timer pulse.\n");
+         return EXIT_FAILURE;
+    }
+
+    /* Connect to our channel */
+    if((event.sigev_coid = message_connect(dpp, MSG_FLAG_SIDE_CHANNEL)) == -1) {
+        fprintf(stderr, "Unable to attach to channel.\n");
+        return EXIT_FAILURE;
+    }
+
+    event.sigev_notify = SIGEV_PULSE;
+    event.sigev_priority = -1;
+    /* We could create several timers and use different sigev values for each */
+    event.sigev_value.sival_int = 0;
+
+    if((timer_id = TimerCreate(CLOCK_REALTIME, &event)) == -1) {;
+        fprintf(stderr, "Unable to attach channel and connection.\n");
+        return EXIT_FAILURE;
+    }
+
+    /* And now setup our timer to fire every second */
+    itime.nsec = 1000000000;
+    itime.interval_nsec = 1000000000;
+    TimerSettime(timer_id, 0, &itime, NULL);
 
     /* Start the thread which will handle interrupt events. */
-    pthread_create ( NULL, NULL, metronome_thread, NULL );
-
+    pthread_create(NULL, NULL, metronome_thread, NULL);
+    printf("DEBUG - Metronome thread started\n");
     /* Never returns */
     thread_pool_start( tpp );
+    printf("DEBUG - Thread pool started\n");
 
+    // TODO: Probably dont need this code below
+
+    	/* Allocate dispatch context - Contains all relevant data for the message receive loop */
 	ctp = dispatch_context_alloc(dpp);
 
 	while(1)
 	{
-		ctp = dispatch_block(ctp);
-		dispatch_handler(ctp);
+		ctp = dispatch_block(ctp); /* Perform the msgReceive and store relevant msginfo */
+		dispatch_handler(ctp);     /* Lookup on function tables created and call the appropriate functions for each message received */
 	}
 	return EXIT_SUCCESS;
 }
