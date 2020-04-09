@@ -206,17 +206,11 @@ void* metronome_thread(void* argv)
 		    	  // MsgError(rcvid, EOK); /* Respond to the input */
 			   	   break;
 		       case QUIT_PULSE_CODE:
-
-		    	   /*
-		    	    * TODO:
-		    	    * implement Phase III:
-		    	    * delete interval timer
-		    	    * call name_detach()
-		    	    * call name_close()
-		    	    * exit with SUCCESS
-		    	    */
-		    	   printf("Exiting\n");
-			   	   break;
+		    	   	   /* Phase III - Cleanup */
+		    	   timer_delete(timer_id);
+		    	   name_detach(attach, 0);
+		    	   name_close(metronome_coid);
+			   	   exit(EXIT_SUCCESS);
 			   default:
 				   printf("Not the expected Code %d Value %d\n", metronome_msg.METRONOME.pulse_code, metronome_msg.pulse.value.sival_int);
 				   break;
