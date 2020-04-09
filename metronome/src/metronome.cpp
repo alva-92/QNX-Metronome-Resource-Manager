@@ -28,8 +28,8 @@ static iofunc_attr_t            ioattr;           /* Describes the attributes of
 #define PATHNAME                "/dev/local/metronome"
 #define ATTACH_POINT            "metronome"
 #define METRONOME_PULSE_CODE    9
-#define PAUSE_PULSE_CODE        (METRONOME_PULSE_CODE + 7)
-#define QUIT_PULSE_CODE         (METRONOME_PULSE_CODE + 8)
+#define PAUSE_PULSE_CODE        7
+#define QUIT_PULSE_CODE         8
 #define EXPECTED_NUM_ATTR       4
 
 typedef union
@@ -37,6 +37,7 @@ typedef union
 	struct _pulse   pulse;
 	struct METRONOME
 	{
+		int             pulse_code;
 		int             beats_per_minute;
 		int             time_signature_top;
 		int             time_signature_bottom;
@@ -74,7 +75,8 @@ int coid;
 int     chid;               // channel ID (global)
 char data[255];
 int metronome_coid;
-my_message_t msg; /* Actual message structure */
+my_message_t metronome_msg; /* Actual message structure */
+my_message_t *recv_msg;
 double output_internal;
 double pattern_interval;
 char    *progname = "time1.c";
@@ -87,29 +89,14 @@ dispatch_context_t   *ctp;
 int                  id;
 name_attach_t *attach;
 int rcvid; /* Process ID of the sender  */
+double spacing_timer;
+
+float  seconds_per_beat;
+int    nanos_per_beat;
 
 void display_usage()
 {
 	printf("Usage:\n ./metronome <beats-per-minute> <time-signature-top> <time-signature-bottom>\n");
-}
-
-int timer_tick(message_context_t *ctp, int code, unsigned flags, void *handle) {
-
-    union sigval value = ctp->msg->pulse.value;
-    /*
-     *  Do some useful work on every timer firing
-     *  ....
-     */
-
-    current_pattern++;
-    MsgSendPulse(coid, SchedGet(0,0,NULL), value.sival_int, current_pattern);
-    printf("Received timer event, Sending pulse to coid %d with pulse value %d\n", coid, value.sival_int);
-    return 0;
-}
-
-int message_handler(message_context_t *ctp, int code, unsigned flags, void *handle) {
-    printf("received private message, type %d\n", code);
-    return 0;
 }
 
 /**
@@ -121,97 +108,92 @@ void* metronome_thread(void* argv)
 		/* Phase I - create a named channel to receive pulses */
 
 	/* Create a local name to register the device and create a channel */
-	if ((attach = name_attach(dpp, ATTACH_POINT, 0)) == NULL)
+	if ((attach = name_attach(NULL, ATTACH_POINT, 0)) == NULL)
+	//if ((attach = name_attach(NULL, ATTACH_POINT, 0)) == NULL)
 	{
 		printf("Failed to attach to device\n");
 		return NULL;
 	}
 
 		/* Calculate the seconds-per-beat and nano seconds for the interval timer */
-	pattern_interval = (60/msg.METRONOME.beats_per_minute)*msg.METRONOME.time_signature_top; /* Calculate the time for starting a new line */
+	pattern_interval = (60.0/metronome_msg.METRONOME.beats_per_minute)*metronome_msg.METRONOME.time_signature_top; /* Calculate the time for starting a new line */
 	output_internal = 0.0;
 
 	for (int i = 0; i < 8; i++)
 	{
-		if (t[i].time_signature_top == msg.METRONOME.time_signature_top && t[i].time_signature_bottom == msg.METRONOME.time_signature_bottom)
+		if (t[i].time_signature_top == metronome_msg.METRONOME.time_signature_top && t[i].time_signature_bottom == metronome_msg.METRONOME.time_signature_bottom)
 		{
 			output_internal = t[i].num_intervals;
+			row = 0;
 			printf("MATCH - Time signature top %d Time signature bottom %d Output interval %d\n", t[i].time_signature_top, t[i].time_signature_bottom, t[i].num_intervals);
 		}
 	}
 
 		/* Create interval timer to drive metronome */
-	double spacing_timer    = pattern_interval/output_internal; /* Actual output interval */
+	spacing_timer    = pattern_interval/output_internal; /* Actual output interval */
+	spacing_timer    *= 1000000000; /* Covert to nano seconds */
 
 	 // TODO: configure the interval timer to send a pulse to channel at attach when it expires
+    struct sigevent         event;
+    struct itimerspec       itime;
+    timer_t                 timer_id;
+    struct sched_param      scheduling_params;
+    int                     prio;
 
-    struct sigevent      event;
-    struct _itimer       itime;
-    int                  timer_id;
 
-    // TODO: Private messaging needed?
-    /* We want to handle our own private messages, of type 0x5000 to 0x5fff */
-    if(message_attach(dpp, NULL, 0x5000, 0x5fff, &message_handler, NULL) == -1) {
-        fprintf(stderr, "Unable to attach to private message range.\n");
-        return NULL;
-    }
+    /* Get our priority. */
+	if (SchedGet(0, 0, &scheduling_params) != -1)
+	{
+		prio = scheduling_params.sched_priority;
+	}
+	else
+	{
+		prio = 10;
+	}
 
-    /* Initialize an event structure, and attach a pulse to it */
-    if((event.sigev_code = pulse_attach(dpp, MSG_FLAG_ALLOC_PULSE, METRONOME_PULSE_CODE, &timer_tick,
-                                        NULL)) == -1)
-    {
-        fprintf(stderr, "Unable to attach timer pulse.\n");
-        return NULL;
-    }
+	   event.sigev_notify = SIGEV_PULSE;
+	   event.sigev_coid = ConnectAttach(ND_LOCAL_NODE,
+			                            0,
+			                            attach->chid,
+	                                    _NTO_SIDE_CHANNEL,
+										0);
+	   event.sigev_priority  = prio;
+	   event.sigev_code      = METRONOME_PULSE_CODE;
+	   timer_create(CLOCK_MONOTONIC, &event, &timer_id);
 
-    /* Connect to our channel */
-    if((event.sigev_coid = message_connect(dpp, MSG_FLAG_SIDE_CHANNEL)) == -1) {
-        fprintf(stderr, "Unable to attach to channel.\n");
-        return NULL;
-    }
-
-    coid = event.sigev_coid;
-
-    event.sigev_notify = SIGEV_PULSE;
-    event.sigev_priority = -1;
-    /* We could create several timers and use different sigev values for each */
-    event.sigev_value.sival_int = METRONOME_PULSE_CODE;
-
-    if((timer_id = TimerCreate(CLOCK_REALTIME, &event)) == -1) {;
-        fprintf(stderr, "Unable to attach channel and connection.\n");
-        return NULL;
-    }
-
-    /* And now setup our timer to fire every second */
-    itime.nsec = 1000000000;
-    itime.interval_nsec = 1000000000;
-    TimerSettime(timer_id, 0, &itime, NULL);
+	   itime.it_value.tv_sec     = 1;
+	   itime.it_value.tv_nsec    = 500000000;
+	   itime.it_interval.tv_sec  = 1;
+	   itime.it_interval.tv_nsec = 500000000;
+	   timer_settime(timer_id, 0, &itime, NULL);
 
 		/* Phase II - receive pulses from interval timer OR io_write(pause, quit) */
-	while(1)
+	for(;;)
 	{
-	   rcvid = MsgReceive(attach->chid, &msg, sizeof(msg), NULL);
+	   rcvid = MsgReceivePulse(attach->chid, (void*) &data, sizeof(data), NULL);
 	   if (rcvid == -1) /* Error condition, exit */
 	   {
 		   printf("Failed to receive message\n");
 		   break;
 	   }
-
+	   recv_msg = (my_message_t*) data;
 	   if (rcvid == 0) /* Pulse received */
 	   {
-		   switch (msg.pulse.code)
+		   switch (recv_msg->pulse.code)
 		   {
 			   case METRONOME_PULSE_CODE:
 
 			   	   /*
 			   	    * TODO
 			   	    * display the beat to stdout
+			   	    *
 			   	    * must handle 3 cases:
 			   	    * start-of-measure: |1
 			   	    * mid-measure: the symbol, as seen in the column "Pattern for Intervals within Each Beat"
 			   	    * end-of-measure: \n
 			   	    */
-				   printf("Metronome pulse receiving pattern index: %d\n", current_pattern);
+				   printf("%s\n", t[row].pattern);
+
 				   break;
 
 		       case PAUSE_PULSE_CODE:
@@ -220,8 +202,8 @@ void* metronome_thread(void* argv)
 		    	    * TODO:
 		    	    * pause the running timer for pause <int> seconds
 		    	    */
-		    	   printf("Pausing running timer\n");
-
+		    	   printf("Pausing running timer for %d\n", recv_msg->pulse.value.sival_int);
+		    	  // MsgError(rcvid, EOK); /* Respond to the input */
 			   	   break;
 		       case QUIT_PULSE_CODE:
 
@@ -236,15 +218,14 @@ void* metronome_thread(void* argv)
 		    	   printf("Exiting\n");
 			   	   break;
 			   default:
-				   printf("Not the expected code %d\n", msg.pulse.code);
+				   printf("Not the expected Code %d Value %d\n", metronome_msg.METRONOME.pulse_code, metronome_msg.pulse.value.sival_int);
 				   break;
 			   }
 		   continue;
+	   }else{
+		   MsgError(rcvid, EOK); /* Respond to the input */
 	   }
-	   printf("Other..\n");
-
 	}
-	printf("Exiting thread..\n");
 	return NULL;
 }
 
@@ -264,8 +245,16 @@ int io_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb)
 		return 0;
 	}
 
-	//TODO: calculations for secs-per-beat, nanoSecs
-	sprintf(data, "[metronome: %d beats/min, time signature %d/%d, secs-per-beat: %.2f, nanoSecs: %d]\n");
+	/* Calculate the seconds-per-beat and nano seconds for the interval timer */
+	seconds_per_beat = (60.0/metronome_msg.METRONOME.beats_per_minute);
+	nanos_per_beat   = seconds_per_beat * 1000000000;
+
+	sprintf(data, "[metronome: %d beats/min, time signature %d/%d, secs-per-beat: %.2f, nanoSecs: %d]\n",
+			metronome_msg.METRONOME.beats_per_minute,
+			metronome_msg.METRONOME.time_signature_top,
+			metronome_msg.METRONOME.time_signature_bottom,
+			seconds_per_beat,
+			nanos_per_beat);
 
 	nb = strlen(data);
 
@@ -279,7 +268,7 @@ int io_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb)
 
 	_IO_SET_READ_NBYTES(ctp, nb); /* Read nbytes of data and set the number of bytes we will return */
 	SETIOV(ctp->iov, data, nb);   /* Fill the return buffer with the data and size (Copy data into reply buffer) */
-	ocb->offset += nb; /* update offset into our data used to determine start position for next read. */
+	ocb->offset += nb;            /* update offset into our data used to determine start position for next read. */
 
 	if (nb > 0) /* If we are going to send any bytes update the access time for this resource. */
 	{
@@ -306,23 +295,21 @@ int io_write(resmgr_context_t *ctp, io_write_t *msg, RESMGR_OCB_T *ocb)
     {
 		char *buf;
 		char *pause_msg;
-		int i;
-		int pause;
-		buf = (char *)(msg+1);
+		int  i;
+		int  pause;
 
-		std::cout << "Buffer: " << buf << "\n" << std::endl;
-		std::cout.flush();
+		buf = (char *)(msg+1);
 
 		if(strstr(buf, "pause") != NULL)
 		{
 			/* Process pause value */
-			for(i = 0; i < 2; i++){
+			for(i = 0; i < 2; i++)
+			{
 				pause_msg = strsep(&buf, " ");
 			}
 			pause = atoi(pause_msg);
 			if(pause >= 1 && pause <= 10)
 			{
-				printf("Sending pause message\n");
 				MsgSendPulse(metronome_coid, SchedGet(0,0,NULL), PAUSE_PULSE_CODE, pause);
 			}
 			else
@@ -333,12 +320,10 @@ int io_write(resmgr_context_t *ctp, io_write_t *msg, RESMGR_OCB_T *ocb)
 		else if (strstr(buf, "quit") != NULL)
 		{
 			/* Process quit value */
-			printf("Sending pulse to quit\n");
 			MsgSendPulse(metronome_coid, SchedGet(0,0,NULL), QUIT_PULSE_CODE, 0);
 		}
 		else
 		{
-			printf("Normal execution\n");
 			strcpy(data, buf);
 		}
 
@@ -369,7 +354,6 @@ int io_open(resmgr_context_t *ctp, io_open_t *msg, RESMGR_HANDLE_T *handle, void
         perror("name_open failed.\n");
         return EXIT_FAILURE;
     }
-    printf("IO Opened\n");
     return (iofunc_open_default(ctp, msg, handle, extra));
 }
 
@@ -383,10 +367,10 @@ int main(int argc, char *argv[])
 	}
 
     	/* Process command line input */
-    memset(&msg, 0, sizeof(my_message_t));
-    msg.METRONOME.beats_per_minute      = atoi(argv[1]);
-    msg.METRONOME.time_signature_top    = atoi(argv[2]);
-    msg.METRONOME.time_signature_bottom = atoi(argv[3]);
+    memset(&metronome_msg, 0, sizeof(metronome_msg));
+    metronome_msg.METRONOME.beats_per_minute      = atoi(argv[1]);
+    metronome_msg.METRONOME.time_signature_top    = atoi(argv[2]);
+    metronome_msg.METRONOME.time_signature_bottom = atoi(argv[3]);
 
 	/* Create dispatch structure */
 	if ((dpp = dispatch_create()) == NULL)
@@ -435,7 +419,6 @@ int main(int argc, char *argv[])
 
 	pthread_attr_t attr;
 	pthread_attr_init(&attr); /* Initialize attr with all default thread attributes */
-    /* Start the thread which will handle interrupt events. */
     if (pthread_create(NULL, &attr, metronome_thread, NULL) != 0)
 	{
 		printf("Error creating metronome thread\n");
