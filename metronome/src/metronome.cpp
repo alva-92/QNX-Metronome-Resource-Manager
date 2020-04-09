@@ -11,6 +11,7 @@
 #include <sys/siginfo.h>
 #include <sys/neutrino.h>
 #include <sys/netmgr.h>
+#include <math.h>
 
 /*
  * Define THREAD_POOL_PARAM_T such that we can avoid a compiler
@@ -31,6 +32,7 @@ static iofunc_attr_t            ioattr;           /* Describes the attributes of
 #define PAUSE_PULSE_CODE        7
 #define QUIT_PULSE_CODE         8
 #define EXPECTED_NUM_ATTR       4
+#define NSECS_PER_SEC 1000000000
 
 typedef union
 {
@@ -93,6 +95,12 @@ double spacing_timer;
 
 float  seconds_per_beat;
 int    nanos_per_beat;
+pid_t tid;
+struct sigevent         event;
+struct itimerspec       itime;
+timer_t                 timer_id;
+struct sched_param      scheduling_params;
+int                     prio;
 
 void display_usage()
 {
@@ -106,7 +114,7 @@ void display_usage()
 void* metronome_thread(void* argv)
 {
 		/* Phase I - create a named channel to receive pulses */
-
+	tid = gettid();
 	/* Create a local name to register the device and create a channel */
 	if ((attach = name_attach(NULL, ATTACH_POINT, 0)) == NULL)
 	//if ((attach = name_attach(NULL, ATTACH_POINT, 0)) == NULL)
@@ -116,6 +124,7 @@ void* metronome_thread(void* argv)
 	}
 
 		/* Calculate the seconds-per-beat and nano seconds for the interval timer */
+	printf("Pattern calculation 60.0 / %d x %d\n",metronome_msg.METRONOME.beats_per_minute, metronome_msg.METRONOME.time_signature_top);
 	pattern_interval = (60.0/metronome_msg.METRONOME.beats_per_minute)*metronome_msg.METRONOME.time_signature_top; /* Calculate the time for starting a new line */
 	output_internal = 0.0;
 
@@ -134,11 +143,7 @@ void* metronome_thread(void* argv)
 	spacing_timer    *= 1000000000; /* Covert to nano seconds */
 
 	 // TODO: configure the interval timer to send a pulse to channel at attach when it expires
-    struct sigevent         event;
-    struct itimerspec       itime;
-    timer_t                 timer_id;
-    struct sched_param      scheduling_params;
-    int                     prio;
+
 
 
     /* Get our priority. */
@@ -161,10 +166,34 @@ void* metronome_thread(void* argv)
 	   event.sigev_code      = METRONOME_PULSE_CODE;
 	   timer_create(CLOCK_MONOTONIC, &event, &timer_id);
 
-	   itime.it_value.tv_sec     = 1;
-	   itime.it_value.tv_nsec    = 500000000;
-	   itime.it_interval.tv_sec  = 1;
-	   itime.it_interval.tv_nsec = 500000000;
+	   int  sec = 0;
+	   double  nanos = 0.0;
+	   double integer, decimal = 0.0;
+	   double temp = pattern_interval;
+
+	   printf("Pattern interval %.2f\n", pattern_interval);
+	   while(temp != 0){
+		   decimal = modf(pattern_interval, &integer);
+		   if (decimal != 0){
+			   printf("Integer %.2f - Remainer %.2f\n", integer, decimal);
+			   nanos = decimal*1000000000; /* Convert to nano seconds */
+		   }
+		   if (integer != 0){
+
+			   sec = pattern_interval;
+		   }
+		   temp -= (integer + decimal);
+		   printf("Temp %.2f\n", temp);
+	   }
+
+	   printf("Running timer every %d seconds and %.2f nano seconds\n", sec, nanos);
+
+	   	   /* Timer Interval */
+	   itime.it_value.tv_sec     = sec;
+	   itime.it_value.tv_nsec    = nanos;
+	   	   /* Initial Expiration */
+	   itime.it_interval.tv_sec  = sec;
+	   itime.it_interval.tv_nsec = nanos;
 	   timer_settime(timer_id, 0, &itime, NULL);
 
 		/* Phase II - receive pulses from interval timer OR io_write(pause, quit) */
@@ -192,7 +221,7 @@ void* metronome_thread(void* argv)
 			   	    * mid-measure: the symbol, as seen in the column "Pattern for Intervals within Each Beat"
 			   	    * end-of-measure: \n
 			   	    */
-				   printf("%s\n", t[row].pattern);
+				   printf("%s", t[row].pattern);
 
 				   break;
 
@@ -203,7 +232,12 @@ void* metronome_thread(void* argv)
 		    	    * pause the running timer for pause <int> seconds
 		    	    */
 		    	   printf("Pausing running timer for %d\n", recv_msg->pulse.value.sival_int);
-		    	  // MsgError(rcvid, EOK); /* Respond to the input */
+		    	   itime.it_value.tv_sec = recv_msg->pulse.value.sival_int;
+		    	   itime.it_value.tv_nsec = 0;
+		    	   timer_settime(timer_id, 0, &itime,0);
+
+
+
 			   	   break;
 		       case QUIT_PULSE_CODE:
 		    	   	   /* Phase III - Cleanup */
@@ -216,8 +250,6 @@ void* metronome_thread(void* argv)
 				   break;
 			   }
 		   continue;
-	   }else{
-		   MsgError(rcvid, EOK); /* Respond to the input */
 	   }
 	}
 	return NULL;
