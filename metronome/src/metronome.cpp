@@ -34,7 +34,9 @@ static iofunc_attr_t ioattr;                 /* Describes the attributes of the 
 #define QUIT_PULSE_CODE         8
 #define EXPECTED_NUM_ATTR       4
 #define NSECS_PER_SEC           1000000000
-
+#define UPPER_INPUT_LIMIT       9
+#define LOWER_INPUT_LIMIT       1
+#define NUM_PATTERNS            8
 typedef union
 {
 	struct _pulse pulse;
@@ -44,15 +46,16 @@ typedef union
 		int beats_per_minute;
 		int time_signature_top;
 		int time_signature_bottom;
+
 	} METRONOME;
 
 } my_message_t;
 
 struct DataTableRow
 {
-	int time_signature_top;
-	int time_signature_bottom;
-	int num_intervals;
+	int         time_signature_top;
+	int         time_signature_bottom;
+	int         num_intervals;
 	std::string pattern;
 
 }typedef DataTableRow;
@@ -68,43 +71,44 @@ DataTableRow t[] = {
 		{ 3, 8, 6,   "|1-2-3-" },
 		{ 6, 8, 6,   "|1&a2&a" },
 		{ 9, 8, 9,   "|1&a2&a3&a" },
-		{ 12, 8, 12, "|1&a2&a3&a4&a" } };
+		{ 12, 8, 12, "|1&a2&a3&a4&a" }
+};
 
-int row;
-int coid;
-int chid;               // channel ID (global)
-char data[255];
-int metronome_coid;
-my_message_t metronome_msg; /* Actual message structure */
-my_message_t *recv_msg;
-double output_internal;
-double pattern_interval;
-char *progname = "time1.c";
-int current_pattern;
-thread_pool_attr_t pool_attr; /* Specifies the attributes that you want to use for the thread pool */
-thread_pool_t *tpp;
-dispatch_t *dpp; /* Dispatch structure used to schedule the calling of user functions */
-resmgr_attr_t resmgr_attr;
+    /* Resource Manager */
+dispatch_t         *dpp;           /* Dispatch structure used to schedule the calling of user functions */
+resmgr_attr_t      resmgr_attr;
 dispatch_context_t *ctp;
-int id;
-name_attach_t *attach;
-int rcvid; /* Process ID of the sender  */
-double spacing_timer;
 
-float seconds_per_beat;
-int nanos_per_beat;
-pid_t tid;
-struct sigevent event;
-struct itimerspec itime;
-timer_t timer_id;
+    /* Messaging */
+my_message_t metronome_msg;
+my_message_t *recv_msg;
+char         data[255];
+
+    /* Time Driver */
+struct itimerspec  itime;
+timer_t            timer_id;
+struct sigevent    event;
 struct sched_param scheduling_params;
-int prio;
-std::string str = "0";
-unsigned int char_index = 0;
-bool case_1 = true;
-int current_output;
-bool output_complete = false;
 
+    /* Flags */
+bool output_complete = false;
+bool case_1          = true;
+
+    /* Application variables */
+int          row;
+int          metronome_coid;
+double       output_internal;
+double       pattern_interval;
+int          current_pattern;
+int          id;
+double       spacing_timer;
+std::string  str = "0";
+unsigned int char_index = 0;
+int          current_output;
+
+/**
+ * This function displays the usage information to the user 
+ */
 void display_usage()
 {
 	printf("Usage:\n ./metronome <beats-per-minute> <time-signature-top> <time-signature-bottom>\n");
@@ -116,10 +120,11 @@ void display_usage()
  */
 void* metronome_thread(void* argv)
 {
-	/* Phase I - create a named channel to receive pulses */
-	tid = gettid();
-	/* Create a local name to register the device and create a channel */
-	if ((attach = name_attach(NULL, ATTACH_POINT, 0)) == NULL)
+	        /* Phase I - create a named channel to receive pulses */
+	
+	    /* Create a local name to register the device and create a channel */
+	name_attach_t *attach;
+	if ((attach = name_attach(NULL, ATTACH_POINT, 0)) == NULL) 
 	{
 		printf("Failed to attach to device\n");
 		return NULL;
@@ -128,26 +133,24 @@ void* metronome_thread(void* argv)
 	pattern_interval = (60.0 / metronome_msg.METRONOME.beats_per_minute) * metronome_msg.METRONOME.time_signature_top; /* Calculate the time for starting a new line */
 	output_internal  = 0.0;
 
-	for (int i = 0; i < 8; i++)
+	for (int i = 0; i < NUM_PATTERNS; i++)
 	{
-		if (t[i].time_signature_top == metronome_msg.METRONOME.time_signature_top
-				&& t[i].time_signature_bottom == metronome_msg.METRONOME.time_signature_bottom)
+		if (t[i].time_signature_top == metronome_msg.METRONOME.time_signature_top && 
+		    t[i].time_signature_bottom == metronome_msg.METRONOME.time_signature_bottom)
 		{
 			output_internal = t[i].num_intervals;
 			row = 0;
 			std::string test(t[row].pattern);
 			str = test;
-			printf("MATCH - Time signature top %d Time signature bottom %d Output interval %d\n",
-					t[i].time_signature_top, t[i].time_signature_bottom,
-					t[i].num_intervals);
 		}
 	}
 
 	/* Create interval timer to drive metronome */
 	spacing_timer = pattern_interval / output_internal; /* Actual output interval */
-	spacing_timer *= 1000000000; /* Covert to nano seconds */
+	spacing_timer *= 1000000000;                        /* Covert to nano seconds */
 
-	/* Get our priority. */
+	    /* Get our priority. */
+	int prio;
 	if (SchedGet(0, 0, &scheduling_params) != -1)
 	{
 		prio = scheduling_params.sched_priority;
@@ -157,29 +160,27 @@ void* metronome_thread(void* argv)
 		prio = 10;
 	}
 
-	event.sigev_notify = SIGEV_PULSE;
-	event.sigev_coid = ConnectAttach(ND_LOCAL_NODE, 0, attach->chid,
-	_NTO_SIDE_CHANNEL, 0);
+	event.sigev_notify   = SIGEV_PULSE;
+	event.sigev_coid     = ConnectAttach(ND_LOCAL_NODE, 0, attach->chid, _NTO_SIDE_CHANNEL, 0);
 	event.sigev_priority = prio;
-	event.sigev_code = METRONOME_PULSE_CODE;
+	event.sigev_code     = METRONOME_PULSE_CODE;
 	timer_create(CLOCK_MONOTONIC, &event, &timer_id);
 
-	int sec = 0;
-	double nanos = 0.0;
-	double integer, decimal = 0.0;
-	double temp = pattern_interval;
+	int sec        = 0;
+	double nanos   = 0.0;
+	double integer = 0.0;
+	double decimal = 0.0;
+	double temp    = pattern_interval;
 
-	printf("Pattern interval %.2f\n", spacing_timer);
 	while (temp != 0)
 	{
 		decimal = modf(pattern_interval, &integer);
 		if (decimal != 0)
 		{
-			printf("Integer %.2f - Remainer %.2f\n", integer, decimal);
 			nanos = decimal * 1000000000; /* Convert to nano seconds */
 		}
-		if (integer != 0) {
-
+		if (integer != 0) 
+		{
 			sec = pattern_interval;
 		}
 		temp -= (integer + decimal);
@@ -187,18 +188,18 @@ void* metronome_thread(void* argv)
 
 	printf("Running timer every %d seconds and %.2f nano seconds\n", sec, nanos);
 
-	/* Timer Interval */
-	itime.it_value.tv_sec = 0;
-	itime.it_value.tv_nsec = spacing_timer;
-	/* Initial Expiration */
-	itime.it_interval.tv_sec = 0;
+	    /* Timer Interval */
+	itime.it_value.tv_sec     = 0;
+	itime.it_value.tv_nsec    = spacing_timer;
+	    /* Initial Expiration */
+	itime.it_interval.tv_sec  = 0;
 	itime.it_interval.tv_nsec = spacing_timer;
 	timer_settime(timer_id, 0, &itime, NULL);
 
-	/* Phase II - receive pulses from interval timer OR io_write(pause, quit) */
+	        /* Phase II - receive pulses from interval timer OR io_write(pause, quit) */
 	for (;;)
 	{
-		rcvid = MsgReceivePulse(attach->chid, (void*) &data, sizeof(data), NULL);
+		int rcvid = MsgReceivePulse(attach->chid, (void*) &data, sizeof(data), NULL);
 		if (rcvid == -1) /* Error condition, exit */
 		{
 			printf("Failed to receive message\n");
@@ -248,13 +249,13 @@ void* metronome_thread(void* argv)
 				break;
 
 			case PAUSE_PULSE_CODE:
-				/* Pause the running timer */
-				itime.it_value.tv_sec = recv_msg->pulse.value.sival_int;
+				    /* Pause the running timer */
+				itime.it_value.tv_sec  = recv_msg->pulse.value.sival_int;
 				itime.it_value.tv_nsec = 0;
 				timer_settime(timer_id, 0, &itime, 0);
 				break;
 			case QUIT_PULSE_CODE:
-				/* Phase III - Cleanup */
+				    /* Phase III - Cleanup */
 				timer_delete(timer_id);
 				name_detach(attach, 0);
 				name_close(metronome_coid);
@@ -278,7 +279,8 @@ void* metronome_thread(void* argv)
  * @param msg - Pointer to the message sent by the client
  * @param ocb - Pointer to a structure containing the information about the client/server interaction
  */
-int io_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb) {
+int io_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb) 
+{
 	int nb; /* Number of bytes to send back */
 
 	if (data == NULL)
@@ -286,10 +288,10 @@ int io_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb) {
 		return 0;
 	}
 
-	/* Calculate the seconds-per-beat and nano seconds for the interval timer */
-	seconds_per_beat = (60.0 / metronome_msg.METRONOME.beats_per_minute)*metronome_msg.METRONOME.time_signature_top;
+	    /* Calculate the seconds-per-beat and nano seconds for the interval timer */
+	double seconds_per_beat = (60.0 / metronome_msg.METRONOME.beats_per_minute)*metronome_msg.METRONOME.time_signature_top;
 	seconds_per_beat /= output_internal;
-	nanos_per_beat = seconds_per_beat * 1000000000;
+	double nanos_per_beat = seconds_per_beat * 1000000000;
 
 	sprintf(data,
 			"[metronome: %d beats/min, time signature %d/%d, secs-per-beat: %.2f, nanoSecs: %d]\n",
@@ -306,18 +308,18 @@ int io_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb) {
 		return 0;
 	}
 
-	/* Determine how many bytes the client is requesting */
+	    /* Determine how many bytes the client is requesting */
 	nb = std::min<int>(nb, msg->i.nbytes); /* Return which ever is smaller the size of our data or the size of the buffer */
 
 	_IO_SET_READ_NBYTES(ctp, nb); /* Read nbytes of data and set the number of bytes we will return */
-	SETIOV(ctp->iov, data, nb); /* Fill the return buffer with the data and size (Copy data into reply buffer) */
-	ocb->offset += nb; /* update offset into our data used to determine start position for next read. */
+	SETIOV(ctp->iov, data, nb);   /* Fill the return buffer with the data and size (Copy data into reply buffer) */
+	ocb->offset += nb;            /* update offset into our data used to determine start position for next read. */
 
 	if (nb > 0) /* If we are going to send any bytes update the access time for this resource. */
 	{
 		ocb->attr->flags |= IOFUNC_ATTR_ATIME;
 	}
-	/* Return to the resource manager library so it can do a MsgReply */
+	     /* Return to the resource manager library so it can do a MsgReply */
 	return (_RESMGR_NPARTS(1)); /* The one is the number of parts we are sending */
 }
 
@@ -332,7 +334,7 @@ int io_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb) {
 int io_write(resmgr_context_t *ctp, io_write_t *msg, RESMGR_OCB_T *ocb) {
 	int nb = 0;
 
-	/* Check if the number of bytes to be written match the message length - All the data is in the current buffer */
+	    /* Check if the number of bytes to be written match the message length - All the data is in the current buffer */
 	if (msg->i.nbytes == ctp->info.msglen - (ctp->offset + sizeof(*msg))) {
 		char *buf;
 		char *pause_msg;
@@ -341,35 +343,47 @@ int io_write(resmgr_context_t *ctp, io_write_t *msg, RESMGR_OCB_T *ocb) {
 
 		buf = (char *) (msg + 1);
 
-		if (strstr(buf, "pause") != NULL) {
-			/* Process pause value */
-			for (i = 0; i < 2; i++) {
+		if (strstr(buf, "pause") != NULL) 
+		{
+			    /* Process pause value */
+			for (i = 0; i < 2; i++) 
+			{
 				pause_msg = strsep(&buf, " ");
 			}
 			pause = atoi(pause_msg);
-			if (pause >= 1 && pause <= 10) {
+			if (pause >= LOWER_INPUT_LIMIT && pause <= UPPER_INPUT_LIMIT) 
+			{
 				MsgSendPulse(metronome_coid, SchedGet(0, 0, NULL),
-						PAUSE_PULSE_CODE, pause);
-			} else {
+				        PAUSE_PULSE_CODE, pause);
+			} 
+			else 
+			{
 				printf("Pause needs to be a number between 1 and 10. \n");
 			}
-		} else if (strstr(buf, "quit") != NULL) {
-			/* Process quit value */
-			MsgSendPulse(metronome_coid, SchedGet(0, 0, NULL), QUIT_PULSE_CODE,
-					0);
-		} else {
+		} 
+		else if (strstr(buf, "quit") != NULL) 
+		{
+			    /* Process quit value */
+			MsgSendPulse(metronome_coid, SchedGet(0, 0, NULL), 
+			            QUIT_PULSE_CODE,0);
+		} 
+		else 
+		{
 			strcpy(data, buf);
 		}
 
 		nb = msg->i.nbytes;
-	} else {
-		/* There is more data - requires resmgr_msfread to request more data */
+	} 
+	else 
+	{
+		    /* There is more data - requires resmgr_msfread to request more data */
 		printf("There's more data\n");
 	}
 
 	_IO_SET_WRITE_NBYTES(ctp, nb); /* Set the number of bytes that were written */
 
-	if (msg->i.nbytes > 0) {
+	if (msg->i.nbytes > 0) 
+	{
 		ocb->attr->flags |= IOFUNC_ATTR_MTIME | IOFUNC_ATTR_CTIME; /* Update the access times of the resource */
 	}
 	return (_RESMGR_NPARTS(0));
@@ -378,16 +392,18 @@ int io_write(resmgr_context_t *ctp, io_write_t *msg, RESMGR_OCB_T *ocb) {
 /**
  * Overloaded function to handle the setup and identification of a given client
  */
-int io_open(resmgr_context_t *ctp, io_open_t *msg, RESMGR_HANDLE_T *handle,
-		void *extra) {
-	if ((metronome_coid = name_open("metronome", 0)) == -1) {
+int io_open(resmgr_context_t *ctp, io_open_t *msg, RESMGR_HANDLE_T *handle, void *extra)
+{
+	if ((metronome_coid = name_open("metronome", 0)) == -1) 
+	{
 		perror("name_open failed.\n");
 		return EXIT_FAILURE;
 	}
 	return (iofunc_open_default(ctp, msg, handle, extra));
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[]) 
+{
 	    /* Validate the number of command line arguments as per requirements */
 	if (argc != EXPECTED_NUM_ATTR)
 	{
@@ -397,8 +413,8 @@ int main(int argc, char *argv[]) {
 
 	    /* Process command line input */
 	memset(&metronome_msg, 0, sizeof(metronome_msg));
-	metronome_msg.METRONOME.beats_per_minute = atoi(argv[1]);
-	metronome_msg.METRONOME.time_signature_top = atoi(argv[2]);
+	metronome_msg.METRONOME.beats_per_minute      = atoi(argv[1]);
+	metronome_msg.METRONOME.time_signature_top    = atoi(argv[2]);
 	metronome_msg.METRONOME.time_signature_bottom = atoi(argv[3]);
 
 	    /* Create dispatch structure */
@@ -414,8 +430,8 @@ int main(int argc, char *argv[]) {
 
 	    /* Overload the functions */
 	connect_funcs.open = io_open;
-	io_funcs.read = io_read;
-	io_funcs.write = io_write;
+	io_funcs.read      = io_read;
+	io_funcs.write     = io_write;
 
 	    /* Fill out device attributes structure to define the device the resource manager is going to manage */
 	iofunc_attr_init(&ioattr,          /* A pointer to the iofunc_attr_t structure that needs to be initialized */
@@ -438,7 +454,8 @@ int main(int argc, char *argv[]) {
 	                   &io_funcs,      /* I/O routines */
 	                   &ioattr);       /* Pointer to device attributes */
 
-	if (id == -1) {
+	if (id == -1) 
+	{
 		printf("Unable to attach name.\n");
 		return EXIT_FAILURE;
 	}
@@ -447,6 +464,7 @@ int main(int argc, char *argv[]) {
 	pthread_attr_init(&attr); /* Initialize attr with all default thread attributes */
 	if (pthread_create(NULL, &attr, metronome_thread, NULL) != 0) {
 		printf("Error creating metronome thread\n");
+		exit(EXIT_FAILURE);
 	}
 	pthread_attr_destroy(&attr);
 
