@@ -37,6 +37,7 @@ static iofunc_attr_t ioattr;                 /* Describes the attributes of the 
 #define UPPER_INPUT_LIMIT       9
 #define LOWER_INPUT_LIMIT       1
 #define NUM_PATTERNS            8
+
 typedef union
 {
 	struct _pulse pulse;
@@ -97,11 +98,8 @@ bool case_1          = true;
     /* Application variables */
 int          row;
 int          metronome_coid;
-double       output_internal;
-double       pattern_interval;
-int          current_pattern;
+double       num_outputs_pattern; /* Number of outputs of a given pattern */
 int          id;
-double       spacing_timer;
 std::string  str = "0";
 unsigned int char_index = 0;
 int          current_output;
@@ -130,24 +128,23 @@ void* metronome_thread(void* argv)
 		return NULL;
 	}
 
-	pattern_interval = (60.0 / metronome_msg.METRONOME.beats_per_minute) * metronome_msg.METRONOME.time_signature_top; /* Calculate the time for starting a new line */
-	output_internal  = 0.0;
+	    /* Calculate the measure per second */
+	double sec_per_measure = (60.0 / metronome_msg.METRONOME.beats_per_minute) * metronome_msg.METRONOME.time_signature_top;
 
+	num_outputs_pattern  = 0.0;
 	for (int i = 0; i < NUM_PATTERNS; i++)
 	{
 		if (t[i].time_signature_top == metronome_msg.METRONOME.time_signature_top && 
 		    t[i].time_signature_bottom == metronome_msg.METRONOME.time_signature_bottom)
 		{
-			output_internal = t[i].num_intervals;
+			num_outputs_pattern = t[i].num_intervals;
 			row = 0;
 			std::string test(t[row].pattern);
 			str = test;
 		}
 	}
 
-	/* Create interval timer to drive metronome */
-	spacing_timer = pattern_interval / output_internal; /* Actual output interval */
-	spacing_timer *= 1000000000;                        /* Covert to nano seconds */
+	double interval_length = (sec_per_measure / num_outputs_pattern)*NSECS_PER_SEC;
 
 	    /* Get our priority. */
 	int prio;
@@ -166,34 +163,12 @@ void* metronome_thread(void* argv)
 	event.sigev_code     = METRONOME_PULSE_CODE;
 	timer_create(CLOCK_MONOTONIC, &event, &timer_id);
 
-	int sec        = 0;
-	double nanos   = 0.0;
-	double integer = 0.0;
-	double decimal = 0.0;
-	double temp    = pattern_interval;
-
-	while (temp != 0)
-	{
-		decimal = modf(pattern_interval, &integer);
-		if (decimal != 0)
-		{
-			nanos = decimal * 1000000000; /* Convert to nano seconds */
-		}
-		if (integer != 0) 
-		{
-			sec = pattern_interval;
-		}
-		temp -= (integer + decimal);
-	}
-
-	printf("Running timer every %d seconds and %.2f nano seconds\n", sec, nanos);
-
 	    /* Timer Interval */
 	itime.it_value.tv_sec     = 0;
-	itime.it_value.tv_nsec    = spacing_timer;
+	itime.it_value.tv_nsec    = interval_length;
 	    /* Initial Expiration */
 	itime.it_interval.tv_sec  = 0;
-	itime.it_interval.tv_nsec = spacing_timer;
+	itime.it_interval.tv_nsec = interval_length;
 	timer_settime(timer_id, 0, &itime, NULL);
 
 	        /* Phase II - receive pulses from interval timer OR io_write(pause, quit) */
@@ -212,33 +187,42 @@ void* metronome_thread(void* argv)
 			{
 			case METRONOME_PULSE_CODE:
 
-				if (output_complete){
+				if (output_complete)
+				{
 					/* No need to process more pulses - Measures are done */
 					// TODO: Destroy timer as there is no need to send more pulses
 					break;
-				}else {
+				}
+				else
+				{
 
-					if (current_output == output_internal){
+					if (current_output == num_outputs_pattern){
 						output_complete = true;
 						/* Done break the loop */
 						break;
 					}
 
 					/* Case 1 - Start sequence */
-					if (case_1) {
+					if (case_1)
+					{
 						std::cout << str[char_index] << str[char_index + 1];
 						std::cout.flush();
 						case_1 = false;
 						char_index = 2;
-					} else {
-						if (char_index == str.length()) {
+					}
+					else
+					{
+						if (char_index == str.length())
+						{
 							/* End of measure*/
 							std::cout << "\n";
 							std::cout.flush();
 							char_index = 0;
 							case_1 = true;
 							current_output++;
-						} else {
+						}
+						else
+						{
 							/* Mid measure */
 							std::cout << str[char_index];
 							std::cout.flush();
@@ -289,9 +273,11 @@ int io_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb)
 	}
 
 	    /* Calculate the seconds-per-beat and nano seconds for the interval timer */
+
+    /* Calculate the measure per second */
 	double seconds_per_beat = (60.0 / metronome_msg.METRONOME.beats_per_minute)*metronome_msg.METRONOME.time_signature_top;
-	seconds_per_beat /= output_internal;
-	double nanos_per_beat = seconds_per_beat * 1000000000;
+	seconds_per_beat /= num_outputs_pattern;
+	int nanos_per_beat = (seconds_per_beat)*NSECS_PER_SEC;
 
 	sprintf(data,
 			"[metronome: %d beats/min, time signature %d/%d, secs-per-beat: %.2f, nanoSecs: %d]\n",
@@ -358,7 +344,7 @@ int io_write(resmgr_context_t *ctp, io_write_t *msg, RESMGR_OCB_T *ocb) {
 			} 
 			else 
 			{
-				printf("Pause needs to be a number between 1 and 10. \n");
+				printf("\nPause needs to be a number between 1 and 9 (Inclusive). \n");
 			}
 		} 
 		else if (strstr(buf, "quit") != NULL) 
@@ -370,6 +356,11 @@ int io_write(resmgr_context_t *ctp, io_write_t *msg, RESMGR_OCB_T *ocb) {
 		else 
 		{
 			strcpy(data, buf);
+			std::string clean_buf(buf);
+			clean_buf.erase(std::remove(clean_buf.begin(), clean_buf.end(), '\n'), str.end()); /* Remove end of line character to properly display data */
+			std::cout << "\nError "<< clean_buf << " is not a supported command" << std::endl;
+			std::cout.flush();
+
 		}
 
 		nb = msg->i.nbytes;
@@ -462,7 +453,8 @@ int main(int argc, char *argv[])
 
 	pthread_attr_t attr;
 	pthread_attr_init(&attr); /* Initialize attr with all default thread attributes */
-	if (pthread_create(NULL, &attr, metronome_thread, NULL) != 0) {
+	if (pthread_create(NULL, &attr, metronome_thread, NULL) != 0)
+	{
 		printf("Error creating metronome thread\n");
 		exit(EXIT_FAILURE);
 	}
